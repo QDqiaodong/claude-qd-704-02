@@ -30,13 +30,16 @@ public class BuildingService {
     private final BuildingRepository buildingRepository;
     private final BuildingFloorRepository buildingFloorRepository;
     private final FacilityPointRepository facilityPointRepository;
+    private final FacilityCodeAllocator codeAllocator;
 
     public BuildingService(BuildingRepository buildingRepository,
                            BuildingFloorRepository buildingFloorRepository,
-                           FacilityPointRepository facilityPointRepository) {
+                           FacilityPointRepository facilityPointRepository,
+                           FacilityCodeAllocator codeAllocator) {
         this.buildingRepository = buildingRepository;
         this.buildingFloorRepository = buildingFloorRepository;
         this.facilityPointRepository = facilityPointRepository;
+        this.codeAllocator = codeAllocator;
     }
 
     /** 建筑台账列表：每栋楼自带楼层列表（页面展开行直接用）。 */
@@ -117,6 +120,9 @@ public class BuildingService {
         building.setCreatedAt(now);
         building.setUpdatedAt(now);
         Building saved = buildingRepository.save(building);
+
+        // 预置该建筑的点位 / 气瓶编号序列行（从 0001 起），后续并发新增在序列行锁上取号
+        codeAllocator.initForBuilding(saved.getCode());
 
         // 楼层按建筑规模自动生成：层面积 = 总面积 / 总层数
         int total = above + below;

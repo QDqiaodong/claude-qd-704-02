@@ -12,10 +12,13 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.fire.protect.common.BizException;
+import com.fire.protect.common.ConflictException;
+import com.fire.protect.common.ForbiddenException;
 import com.fire.protect.domain.Building;
 import com.fire.protect.domain.BuildingFloor;
 import com.fire.protect.domain.DisablePermit;
 import com.fire.protect.domain.FacilityPoint;
+import com.fire.protect.domain.FacilityPointAction;
 import com.fire.protect.domain.FireDict;
 import com.fire.protect.dto.FacilityDtos;
 import com.fire.protect.dto.MaintenanceDtos;
@@ -23,14 +26,17 @@ import com.fire.protect.dto.Views;
 import com.fire.protect.repository.BuildingFloorRepository;
 import com.fire.protect.repository.BuildingRepository;
 import com.fire.protect.repository.DisablePermitRepository;
+import com.fire.protect.repository.FacilityPointActionRepository;
 import com.fire.protect.repository.FacilityPointRepository;
+import com.fire.protect.security.CurrentUserHolder;
 
 /**
  * 模块二：消防设施点位。
  *
- * <p>写入两侧的通用计算（点位编码、下次检查日、过期回落状态）全部在
- * {@link com.fire.protect.listener.FacilityLifecycleListener} 里由 {@code @PrePersist}/{@code @PreUpdate} 完成，
- * 这里只负责校验、挑出实体、改业务字段然后 save。
+ * <p>写入两侧的通用计算（下次检查日、过期回落状态）在
+ * {@link com.fire.protect.listener.FacilityLifecycleListener} 里由 {@code @PrePersist}/{@code @PreUpdate} 完成；
+ * 点位编号不再由「查当前最大序号」生成，而由 {@link FacilityCodeAllocator} 走数据库序列行锁分配，
+ * 新增的并发取号、动作幂等与事务一致性见 {@link #create(FacilityDtos.CreateReq)}。
  */
 @Service
 public class FacilityService {
@@ -41,19 +47,28 @@ public class FacilityService {
     private final BuildingService buildingService;
     private final MaintenanceService maintenanceService;
     private final DisablePermitRepository disablePermitRepository;
+    private final FacilityPointActionRepository actionRepository;
+    private final FacilityActionReservation reservation;
+    private final FacilityPointCreateTx createTx;
 
     public FacilityService(FacilityPointRepository facilityPointRepository,
                            BuildingRepository buildingRepository,
                            BuildingFloorRepository buildingFloorRepository,
                            BuildingService buildingService,
                            MaintenanceService maintenanceService,
-                           DisablePermitRepository disablePermitRepository) {
+                           DisablePermitRepository disablePermitRepository,
+                           FacilityPointActionRepository actionRepository,
+                           FacilityActionReservation reservation,
+                           FacilityPointCreateTx createTx) {
         this.facilityPointRepository = facilityPointRepository;
         this.buildingRepository = buildingRepository;
         this.buildingFloorRepository = buildingFloorRepository;
         this.buildingService = buildingService;
         this.maintenanceService = maintenanceService;
         this.disablePermitRepository = disablePermitRepository;
+        this.actionRepository = actionRepository;
+        this.reservation = reservation;
+        this.createTx = createTx;
     }
 
     /** 当前挂着许可停用标记的许可 id → 许可编号，供平面图 / 台账标注。 */
@@ -128,37 +143,109 @@ public class FacilityService {
     }
 
     /**
-     * 新增点位：只需要给建筑、楼层、类型与位置，
-     * 点位编码、检查周期、下次检查日全部交给 {@code @PrePersist}。
+     * 新增点位（并发 + 重试安全），两阶段幂等：
+     * <ol>
+     *   <li><b>预留</b>：短事务插入动作台账行（PROCESSING），{@code uk_point_action_key}
+     *       是真正的并发串行化点。不同动作各自预留成功；同一动作只有一个能预留，其余不再取号。</li>
+     *   <li><b>完成</b>：独立事务内 校验→行写锁取号→落点位→回填动作行为 DONE，全部同提交。</li>
+     * </ol>
+     *
+     * <ul>
+     *   <li>同一动作因超时 / 重复点击 / 网络重发再次到达，预留行已是 DONE → 直接回放第一次的点位，
+     *       不占新编号、不产生第二条记录；服务重启、多实例都只看数据库，行为一致；</li>
+     *   <li>同一动作标识携带不同表单内容 → 409，提示换新动作标识；</li>
+     *   <li>预留行仍是 PROCESSING（首次处理中 / 对端事务未提交 / 处理进程崩溃）→ 接管继续创建：
+     *       最后的动作回填（只允许 PROCESSING→DONE）保证并发接管中只有一个能完成，
+     *       输家事务整笔回滚（含序号），再回放赢家结果；</li>
+     *   <li>若对端还在处理中（短暂窗口）→ 409 明确提示用同一动作标识稍后重试，本次不落任何数据。</li>
+     * </ul>
      */
-    @Transactional
-    public Views.FacilityView create(FacilityDtos.CreateReq req) {
-        Building building = buildingService.ensureBuilding(req.getBuildingId());
-        if (!FireDict.isValidFacilityType(req.getFacilityType())) {
-            throw new BizException("设施类型只能是：灭火器 / 消火栓 / 喷淋头 / 烟感探测器 / 手动报警按钮 / 应急照明 / 防火门 / 消防泵");
-        }
-        BuildingFloor floor = buildingFloorRepository.findById(req.getFloorId())
-                .orElseThrow(() -> new BizException("楼层不存在：" + req.getFloorId()));
-        if (!floor.getBuildingId().equals(building.getId())) {
-            throw new BizException("所选楼层不属于该建筑");
-        }
-        if (req.getStatus() != null && !FireDict.isValidPointStatus(req.getStatus())) {
-            throw new BizException("点位状态只能是：正常 / 待更换 / 故障 / 停用");
+    public FacilityCreateOutcome create(FacilityDtos.CreateReq req) {
+        String fingerprint = FacilityPointCreateTx.fingerprint(req);
+        String operator = currentOperator();
+
+        // 0) 已存在动作记录：已完成直接回放；处理中进入接管 / 等待判定
+        FacilityPointAction existing = actionRepository.findByActionKey(req.getActionKey()).orElse(null);
+        if (existing != null) {
+            checkFingerprint(existing, fingerprint);
+            if ("DONE".equals(existing.getStatus())) {
+                return new FacilityCreateOutcome(toPointView(ensureActionPoint(existing)), true);
+            }
+            return continueProcessing(req, fingerprint);
         }
 
-        FacilityPoint point = new FacilityPoint();
-        point.setBuildingId(building.getId());
-        point.setFloorId(floor.getId());
-        point.setFacilityType(req.getFacilityType());
-        point.setSpec(req.getSpec());
-        point.setLocationDesc(req.getLocationDesc());
-        point.setInstallDate(req.getInstallDate());
-        point.setCheckCycleDays(req.getCheckCycleDays());
-        point.setPlanX(req.getPlanX() == null ? 500 : req.getPlanX());
-        point.setPlanY(req.getPlanY() == null ? 340 : req.getPlanY());
-        point.setStatus(req.getStatus() == null ? "NORMAL" : req.getStatus());
-        FacilityPoint saved = facilityPointRepository.save(point);
-        return toView(saved, building, floor, permitNoMap());
+        // 1) 预留动作标识（并发串行化点）
+        FacilityPointAction reserved;
+        try {
+            reserved = reservation.reserve(req.getActionKey(), req.getBuildingId(), fingerprint, operator);
+        } catch (ConflictException e) {
+            // 并发下另一请求刚预留（其短事务可能尚未对本事务可见）：重读一次判定
+            reserved = actionRepository.findByActionKey(req.getActionKey()).orElse(null);
+            if (reserved == null) {
+                throw new ConflictException("该新增动作正在另一请求中处理，请稍后用同一动作标识重试（本次未生成点位与编号）");
+            }
+        }
+        checkFingerprint(reserved, fingerprint);
+        if ("DONE".equals(reserved.getStatus())) {
+            return new FacilityCreateOutcome(toPointView(ensureActionPoint(reserved)), true);
+        }
+
+        // 2) PROCESSING：本事务接管完成创建
+        return continueProcessing(req, fingerprint);
+    }
+
+    /**
+     * 预留行为 PROCESSING：在独立事务里完成创建。
+     * 完成时若赢家已抢先把动作置为 DONE（并发接管），则回放赢家点位；
+     * 若赢家事务还在进行（动作仍 PROCESSING），给出可安全重试的 409。
+     */
+    private FacilityCreateOutcome continueProcessing(FacilityDtos.CreateReq req, String fingerprint) {
+        FacilityPoint saved;
+        try {
+            saved = createTx.create(req);
+        } catch (ConflictException e) {
+            FacilityPointAction winner = actionRepository.findByActionKey(req.getActionKey()).orElse(null);
+            if (winner != null && "DONE".equals(winner.getStatus())) {
+                checkFingerprint(winner, fingerprint);
+                return new FacilityCreateOutcome(toPointView(ensureActionPoint(winner)), true);
+            }
+            // 另一个处理者还在提交中：本次什么都没落下，用同一动作标识稍后重试即可
+            throw new ConflictException("该新增动作正在另一请求中处理，编号尚未落定，请稍后用同一动作标识重试（本次未生成点位与编号）");
+        }
+        return new FacilityCreateOutcome(toPointView(saved), false);
+    }
+
+    private void checkFingerprint(FacilityPointAction action, String fingerprint) {
+        if (!fingerprint.equals(action.getRequestFingerprint())) {
+            throw new ConflictException("该动作标识已用于其它内容的新增，请使用页面生成的新动作标识重新提交");
+        }
+    }
+
+    /** DONE 动作指向的点位必须存在（同事务提交保证）；查不到说明数据异常。 */
+    private FacilityPoint ensureActionPoint(FacilityPointAction action) {
+        if (action.getPointId() == null) {
+            throw new BizException("动作 " + action.getActionKey() + " 尚未完成，请稍后用同一动作标识重试");
+        }
+        return facilityPointRepository.findById(action.getPointId())
+                .orElseThrow(() -> new BizException(
+                        "动作 " + action.getActionKey() + " 的点位记录缺失，请联系管理员核对点位台账与动作记录"));
+    }
+
+    private String currentOperator() {
+        try {
+            return CurrentUserHolder.require().getDisplayName();
+        } catch (ForbiddenException e) {
+            // 幂等回放 / 服务端场景不强制身份；实际写库的操作者仅用于动作台账留痕
+            return "匿名";
+        }
+    }
+
+    /** 把已落库点位装成视图（关联建筑 / 楼层 / 许可编号）。 */
+    private Views.FacilityView toPointView(FacilityPoint point) {
+        return toView(point,
+                buildingRepository.findById(point.getBuildingId()).orElse(null),
+                point.getFloorId() == null ? null : buildingFloorRepository.findById(point.getFloorId()).orElse(null),
+                permitNoMap());
     }
 
     /**

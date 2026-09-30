@@ -17,7 +17,11 @@ import jakarta.annotation.PostConstruct;
 /**
  * JPA 实体监听器（{@code @EntityListeners}）跑在容器之外，拿不到 Spring 注入，
  * 这里用一个静态持有者把「查建筑编号 / 查已有编码序号」的能力透出去。
- * 仅在 {@code @PrePersist} 生成点位编码时被调用。
+ *
+ * <p>注意：正常新增链路（点位 / 气瓶）已由 {@code FacilityCodeAllocator} 走数据库序列行写锁
+ * 在 service 层显式分配编号并 setPointCode，{@code @PrePersist} 不会重算（见 fillPointCode
+ * 的非空短路）。下面的「查同前缀最大尾号 +1」只作为没有显式编号时的历史回退，
+ * <b>不保证并发唯一</b>，新代码不要再依赖它取号。
  */
 @Component
 public class FacilityLifecycleSupport {

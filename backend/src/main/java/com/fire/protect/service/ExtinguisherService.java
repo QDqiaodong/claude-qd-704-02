@@ -39,17 +39,20 @@ public class ExtinguisherService {
     private final BuildingFloorRepository buildingFloorRepository;
     private final FacilityPointRepository facilityPointRepository;
     private final BuildingService buildingService;
+    private final FacilityCodeAllocator codeAllocator;
 
     public ExtinguisherService(ExtinguisherRepository extinguisherRepository,
                                BuildingRepository buildingRepository,
                                BuildingFloorRepository buildingFloorRepository,
                                FacilityPointRepository facilityPointRepository,
-                               BuildingService buildingService) {
+                               BuildingService buildingService,
+                               FacilityCodeAllocator codeAllocator) {
         this.extinguisherRepository = extinguisherRepository;
         this.buildingRepository = buildingRepository;
         this.buildingFloorRepository = buildingFloorRepository;
         this.facilityPointRepository = facilityPointRepository;
         this.buildingService = buildingService;
+        this.codeAllocator = codeAllocator;
     }
 
     @Transactional(readOnly = true)
@@ -113,7 +116,9 @@ public class ExtinguisherService {
         cylinder.setPlanX(req.getPlanX() == null ? 500 : req.getPlanX());
         cylinder.setPlanY(req.getPlanY() == null ? 500 : req.getPlanY());
         cylinder.setStatus("NORMAL");
-        // saveAndFlush：让 @PrePersist 当场跑完，返回的台账编码与月检周期即刻可见
+        // 编号由数据库序列行写锁原子分配（与点位同一口径）：并发登记不撞号，删除气瓶不复用旧号
+        cylinder.setPointCode(codeAllocator.allocate(FireDict.EXTINGUISHER_CODE_PREFIX, building.getCode()));
+        // saveAndFlush：让 @PrePersist 当场跑完（编号已显式设置，不会重算），月检周期即刻可见
         Extinguisher saved = extinguisherRepository.saveAndFlush(cylinder);
         return toView(saved, new HashMap<>(), new HashMap<>(), new HashMap<>());
     }

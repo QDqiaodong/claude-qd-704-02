@@ -40,8 +40,10 @@ DROP TABLE IF EXISTS sys_user;
 DROP TABLE IF EXISTS maintenance_order;
 DROP TABLE IF EXISTS inspection_item;
 DROP TABLE IF EXISTS inspection;
+DROP TABLE IF EXISTS facility_point_action;
 DROP TABLE IF EXISTS extinguisher;
 DROP TABLE IF EXISTS facility_point;
+DROP TABLE IF EXISTS facility_code_sequence;
 DROP TABLE IF EXISTS building_floor;
 DROP TABLE IF EXISTS building;
 
@@ -392,6 +394,60 @@ INSERT INTO extinguisher (id, building_id, floor_id, ext_no, steel_no, cyl_type,
     (12, 4, 15, 'EXT-B04-0001', 'GP-2023-0301', 'CO2',    5.00, '2023-03-01', '2025-03-01', '2028-03-01', '2033-03-01', NULL,'办公楼一层门厅',       '2023-03-01', 30, '2026-09-20', '2026-10-20', 'NORMAL', 640, 140, '2026-01-08 11:00:00', '2026-09-20 11:00:00'),
     (13, 5, 17, 'EXT-B05-0001', 'GP-2022-1219', 'POWDER', 8.00, '2022-12-19', '2024-12-19', '2027-12-19', '2032-12-19', 38,  '库区二层东侧疏散口',   '2022-12-19', 30, '2026-09-21', '2026-10-21', 'NORMAL', 880, 140, '2026-01-08 11:00:00', '2026-09-21 11:00:00'),
     (14, 5, 18, 'EXT-B05-0002', 'GP-2023-0515', 'POWDER', 8.00, '2023-05-15', '2025-05-15', '2028-05-15', '2033-05-15', NULL,'库区二层东侧疏散口',   '2023-05-15', 30, '2026-09-21', '2026-10-21', 'NORMAL', 920, 140, '2026-01-08 11:00:00', '2026-09-21 11:00:00');
+
+-- ----------------------------------------------------------------------------
+-- 模块二·并发与重试基础设施（编号序列 + 新增动作台账）
+--
+-- facility_code_sequence：按「前缀-建筑编号」（如 FAC-B02）维护的单调递增序号。
+--   新增点位在同一事务里先 SELECT ... FOR UPDATE 锁住该建筑的序列行，取号并 +1，
+--   再插入点位 —— 同建筑并发新增由数据库行锁串行化，各自拿到不同序号；
+--   多应用实例 / 服务重启都以数据库为准，不依赖单机内存锁；
+--   序号只增不减，删除点位不会把旧序号重新分配。
+--   种子值取上面演示数据里每栋楼的最大尾号（B02 已到 0031，故 31）。
+--
+-- facility_point_action：客户端「新增点位」动作台账（幂等记录）。
+--   action_key 全局唯一：同一客户端动作（超时重发 / 重复点击 / 网络重试）只落成一条点位，
+--   重复请求直接回放第一次创建结果，不再占用新编号；
+--   request_fingerprint 记录首次请求的业务字段指纹，同一动作标识携带不同内容时按冲突拒绝；
+--   动作记录与点位在同一事务提交：失败整体回滚，不会留下「只有编号没有点位」等半成品。
+-- ----------------------------------------------------------------------------
+CREATE TABLE facility_code_sequence (
+    id           BIGINT      NOT NULL AUTO_INCREMENT,
+    seq_key      VARCHAR(24) NOT NULL COMMENT '序列键：<前缀>-<建筑编号>，如 FAC-B02 / EXT-B01',
+    next_value   BIGINT      NOT NULL COMMENT '下一个待分配序号（只增不减，删除点位不复用）',
+    created_at   DATETIME    NOT NULL COMMENT '建立时间',
+    updated_at   DATETIME    NOT NULL COMMENT '最近取号时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_code_seq_key (seq_key)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT '设施编号单调序列（取号加行锁，并发安全）';
+
+INSERT INTO facility_code_sequence (seq_key, next_value, created_at, updated_at) VALUES
+    ('FAC-B01', 3, NOW(), NOW()),
+    ('FAC-B02', 32, NOW(), NOW()),
+    ('FAC-B03', 3, NOW(), NOW()),
+    ('FAC-B04', 2, NOW(), NOW()),
+    ('FAC-B05', 3, NOW(), NOW()),
+    ('EXT-B01', 2, NOW(), NOW()),
+    ('EXT-B02', 10, NOW(), NOW()),
+    ('EXT-B03', 2, NOW(), NOW()),
+    ('EXT-B04', 2, NOW(), NOW()),
+    ('EXT-B05', 3, NOW(), NOW());
+
+CREATE TABLE facility_point_action (
+    id                  BIGINT       NOT NULL AUTO_INCREMENT,
+    action_key          VARCHAR(64)  NOT NULL COMMENT '客户端动作标识（UUID），全局唯一，重发复用',
+    building_id         BIGINT       NOT NULL COMMENT '动作所属建筑',
+    point_id            BIGINT                COMMENT '本动作创建出的点位（与点位同事务回填；PROCESSING 期间为空）',
+    point_code          VARCHAR(32)           COMMENT '本动作实际分配到的点位编号（DONE 后回填，可追踪）',
+    status              VARCHAR(16)  NOT NULL DEFAULT 'PROCESSING' COMMENT 'PROCESSING 预留处理中 / DONE 已完成',
+    request_fingerprint CHAR(64)     NOT NULL COMMENT '首次请求业务字段的 SHA-256 指纹，防同标识不同内容',
+    operator            VARCHAR(32)  NOT NULL COMMENT '首次提交的操作者',
+    created_at          DATETIME     NOT NULL COMMENT '首次处理时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_point_action_key (action_key),
+    KEY idx_point_action_point (point_id),
+    KEY idx_point_action_building (building_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT '新增点位动作台账（幂等留痕，重放不重复建点）';
 
 -- ============================================================================
 -- 模块六：设施停用许可与复位闭环

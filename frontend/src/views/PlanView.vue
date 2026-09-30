@@ -346,40 +346,82 @@
       </template>
     </el-dialog>
 
-    <!-- 新增点位：编码与到期日都由后端生命周期回调生成 -->
-    <el-dialog v-model="createVisible" title="新增消防设施点位" width="560px">
+    <!-- 新增点位：编号由数据库序列在后端分配，页面只在成功后展示实际编号，绝不预填 / 伪造 -->
+    <el-dialog
+      v-model="createVisibleProxy"
+      title="新增消防设施点位"
+      width="560px"
+      :close-on-click-modal="false"
+      :close-on-press-escape="!creating"
+      :show-close="!creating"
+    >
       <el-form :model="createForm" label-width="96px">
+        <el-alert
+          v-if="createdCode"
+          :title="'已创建成功，后端分配编号：' + createdCode"
+          type="success"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+        />
+        <el-alert
+          v-else-if="lastCreateError"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 12px"
+        >
+          <template #default>
+            <div>{{ lastCreateError }}</div>
+            <div style="font-size: 12px; margin-top: 4px">
+              已保留你填写的类型 / 位置 / 坐标，点「重试保存」会用同一动作标识重发，不会重复占用编号；
+              若是校验问题请修改后再重试。
+            </div>
+          </template>
+        </el-alert>
         <div class="fp-form-grid">
           <el-form-item label="所属楼层">
-            <el-select v-model="createForm.floorId" style="width: 100%">
+            <el-select v-model="createForm.floorId" style="width: 100%" :disabled="creating">
               <el-option v-for="f in plan.floors || []" :key="f.id" :label="f.floorCode + ' ' + f.floorName" :value="f.id" />
             </el-select>
           </el-form-item>
           <el-form-item label="设施类型">
-            <el-select v-model="createForm.facilityType" style="width: 100%">
+            <el-select v-model="createForm.facilityType" style="width: 100%" :disabled="creating">
               <el-option v-for="t in facilityTypes" :key="t.code" :label="t.label" :value="t.code" />
             </el-select>
           </el-form-item>
           <el-form-item label="规格型号">
-            <el-input v-model="createForm.spec" placeholder="如 MFZ/ABC4" />
+            <el-input v-model="createForm.spec" placeholder="如 MFZ/ABC4" :disabled="creating" />
           </el-form-item>
           <el-form-item label="安装日期">
-            <el-date-picker v-model="createForm.installDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+            <el-date-picker v-model="createForm.installDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" :disabled="creating" />
           </el-form-item>
           <el-form-item label="图纸 X">
-            <el-input-number v-model="createForm.planX" :min="60" :max="940" :step="10" />
+            <el-input-number v-model="createForm.planX" :min="60" :max="940" :step="10" :disabled="creating" />
           </el-form-item>
           <el-form-item label="图纸 Y">
-            <el-input-number v-model="createForm.planY" :min="60" :max="600" :step="10" />
+            <el-input-number v-model="createForm.planY" :min="60" :max="600" :step="10" :disabled="creating" />
           </el-form-item>
         </div>
         <el-form-item label="位置描述">
-          <el-input v-model="createForm.locationDesc" placeholder="如 三层东侧安全出口旁" />
+          <el-input v-model="createForm.locationDesc" placeholder="如 三层东侧安全出口旁" :disabled="creating" />
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="createVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitCreate">保存（自动生成编号）</el-button>
+        <template v-if="createdCode">
+          <el-button type="primary" @click="closeCreate">完成</el-button>
+        </template>
+        <template v-else>
+          <el-button :disabled="creating" @click="cancelCreate">取消</el-button>
+          <el-button
+            type="primary"
+            :loading="creating"
+            :disabled="!createForm.floorId || !createForm.facilityType"
+            @click="submitCreate"
+          >
+            {{ creating ? '保存中…' : (lastCreateError ? '重试保存' : '保存（自动生成编号）') }}
+          </el-button>
+        </template>
       </template>
     </el-dialog>
   </div>
@@ -387,7 +429,8 @@
 
 <script setup>
 import { computed, inject, onMounted, reactive, ref, watch } from 'vue'
-import { facilityApi } from '../api'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { facilityApi, newActionKey } from '../api'
 
 const fp = inject('fp')
 
@@ -399,6 +442,10 @@ const popVisible = ref(false)
 const popTarget = ref(null)
 const reportVisible = ref(false)
 const createVisible = ref(false)
+/** 成功后后端实际分配的编号（只显示真实值，成功前不预填、不伪造） */
+const createdCode = ref('')
+/** 最近一次保存失败提示（可重试冲突 / 网络超时），保留表单不清空 */
+const lastCreateError = ref('')
 const viewMode = ref('plan')
 const ledgerFilters = ref({
   statuses: ['NORMAL', 'REPLACE', 'FAULT', 'DISABLED'],
@@ -436,6 +483,16 @@ const createForm = reactive({
   planX: 500,
   planY: 340
 })
+
+/**
+ * 新增点位的客户端动作标识：
+ *  - openCreate 时生成一个，保存成功或主动取消后失效（下次打开重新生成）；
+ *  - 请求进行中 / 超时重发 / 网络错误后用户点「重试」期间始终复用同一个值，
+ *    后端据此回放第一次结果，不会重复占用编号。
+ */
+const createActionKey = ref('')
+/** 请求进行中标志：禁用保存 / 取消 / 右上角关闭，杜绝重复触发 */
+const creating = ref(false)
 
 const allPoints = computed(() => plan.value.points || [])
 const currentFloor = computed(() => (plan.value.floors || []).find((f) => f.id === activeFloor.value) || null)
@@ -572,7 +629,18 @@ async function submitReport() {
   await fp.reloadOverview()
 }
 
-function openCreate() {
+/** 弹窗可见性代理：请求进行中不允许通过遮罩 / ESC / 右上角关闭 */
+const createVisibleProxy = computed({
+  get: () => createVisible.value,
+  set: (v) => {
+    if (!v && creating.value) {
+      return
+    }
+    createVisible.value = v
+  }
+})
+
+function resetCreateForm() {
   createForm.floorId = activeFloor.value
   createForm.facilityType = 'HYDRANT'
   createForm.spec = ''
@@ -580,23 +648,82 @@ function openCreate() {
   createForm.installDate = null
   createForm.planX = 500
   createForm.planY = 340
+}
+
+function openCreate() {
+  resetCreateForm()
+  // 每次「新动作」生成新动作标识；同一动作的重试 / 重发复用它，直到成功或放弃
+  createActionKey.value = newActionKey()
+  createdCode.value = ''
+  lastCreateError.value = ''
+  creating.value = false
   createVisible.value = true
 }
 
 async function submitCreate() {
-  await facilityApi.create({
-    buildingId: fp.buildingId.value,
-    floorId: createForm.floorId,
-    facilityType: createForm.facilityType,
-    spec: createForm.spec,
-    locationDesc: createForm.locationDesc,
-    installDate: createForm.installDate || null,
-    planX: createForm.planX,
-    planY: createForm.planY
-  })
+  if (creating.value || !createActionKey.value) {
+    // 请求进行中的重复点击直接忽略，不再触发第二次请求
+    return
+  }
+  if (!createForm.floorId) {
+    ElMessage.warning('请先选择所属楼层')
+    return
+  }
+  creating.value = true
+  lastCreateError.value = ''
+  try {
+    // 超时 / 网络错误后再次进入这里时 createActionKey 不变，后端回放第一次结果，不重复占号
+    const created = await facilityApi.create({
+      actionKey: createActionKey.value,
+      buildingId: fp.buildingId.value,
+      floorId: createForm.floorId,
+      facilityType: createForm.facilityType,
+      spec: createForm.spec,
+      locationDesc: createForm.locationDesc,
+      installDate: createForm.installDate || null,
+      planX: createForm.planX,
+      planY: createForm.planY
+    })
+    // 只展示后端实际分配的编号，页面不预填 / 不伪造
+    createdCode.value = created.pointCode
+    ElMessage.success('点位已建档，编号 ' + created.pointCode)
+    // 刷新当前楼层平面图与台账（数量与气泡都以服务端数据为准），并刷新全局盘面
+    await load()
+    await fp.reloadOverview()
+  } catch (err) {
+    // 保留用户已填的类型 / 位置 / 坐标，不清空表单；错误提示在弹窗内留存，可安全重试
+    lastCreateError.value = err && err.message ? err.message : '保存失败，请稍后重试'
+  } finally {
+    creating.value = false
+  }
+}
+
+/** 成功后点「完成」：关闭弹窗并让下次打开生成新动作标识 */
+function closeCreate() {
   createVisible.value = false
-  await load()
-  await fp.reloadOverview()
+  creating.value = false
+  createdCode.value = ''
+  lastCreateError.value = ''
+  createActionKey.value = ''
+}
+
+/**
+ * 主动取消：若上一次保存失败（可能服务端其实已成功、只是响应没回来），
+ * 提醒用户优先重试——重试复用同一动作标识，后端会回放第一条点位。
+ */
+async function cancelCreate() {
+  if (lastCreateError.value) {
+    try {
+      await ElMessageBox.confirm(
+        '上一次保存结果未知（可能已经创建成功）。直接取消若稍后又重新填写，可能造成重复点位。建议先点「重试保存」，系统会复用本次动作标识返回已创建的点位。确定放弃本次新增？',
+        '请确认是否放弃',
+        { confirmButtonText: '仍然放弃', cancelButtonText: '返回重试', type: 'warning' }
+      )
+    } catch {
+      return
+    }
+  }
+  closeCreate()
 }
 
 watch(() => fp.buildingId.value, load)
