@@ -12,7 +12,8 @@
 -- 数据访问主线：@MappedSuperclass + @AttributeOverride + JPA 生命周期回调。
 --   facility_point 用 @AttributeOverride 把 point_code→fp_no、location_desc→place_desc、
 --   install_date→installed_on；extinguisher 改写成 ext_no / store_place / patrol_* 。
---   @PrePersist：自动生成 FAC-<建筑编号>-<四位序号> 并按检查周期算下次检查日；
+--   点位编号：facility_point_sequence 行锁取号 FAC-<建筑编号>-<四位序号>，并发不撞号、
+--   删除不复用；facility_create_request 动作幂等台账保证超时重发/重启重放只回放首次点位。
 --   @PreUpdate：按上次检查日重算下次检查日，过期自动回落「待更换 / 待充装」。
 --
 -- 本次演示数据围绕主场景建筑 B02「中心商业广场 A 座」（地下 2 层 + 地上 6 层）铺开：
@@ -30,6 +31,8 @@ SET FOREIGN_KEY_CHECKS = 0;
 CREATE DATABASE IF NOT EXISTS fire_protect DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE fire_protect;
 
+DROP TABLE IF EXISTS facility_create_request;
+DROP TABLE IF EXISTS facility_point_sequence;
 DROP TABLE IF EXISTS permit_order_waiver;
 DROP TABLE IF EXISTS reset_verification;
 DROP TABLE IF EXISTS permit_action_log;
@@ -186,6 +189,45 @@ INSERT INTO facility_point (id, building_id, floor_id, fp_no, facility_type, spe
     (36, 4, 14, 'FAC-B04-0001', 'PUMP',       'XBD6.0/30',     '办公楼地下一层消防泵房',   '2021-11-05', 30,  '2026-09-20', '2026-10-20', 'NORMAL',   860, 540, '2026-01-08 10:00:00', '2026-09-20 10:00:00'),
     (37, 5, 17, 'FAC-B05-0001', 'HYDRANT',    'SN65',          '库区主通道消火栓箱',       '2022-10-19', 90,  '2026-09-06', '2026-12-05', 'NORMAL',   400, 340, '2026-01-08 10:00:00', '2026-09-06 10:00:00'),
     (38, 5, 18, 'FAC-B05-0002', 'EXTINGUISHER','MFZ/ABC8',     '库区二层东侧疏散口',       '2022-10-19', 30,  '2026-09-21', '2026-10-21', 'NORMAL',   880, 110, '2026-01-08 10:00:00', '2026-09-21 10:00:00');
+
+-- ----------------------------------------------------------------------------
+-- 点位编号流水 + 新增动作幂等台账
+--   sequence：每栋建筑一行，服务端 SELECT ... FOR UPDATE 锁行取号，next_seq 只进不退
+--             （删除点位不回收旧编号；基线 = 既有编号最大尾号 + 1，与老格式兼容）
+--   create_request：客户端动作标识一行一次新增，重发/重启重放只回放第一次的点位，
+--             取号与建点同在一个事务，失败整体回滚，不存在半成品
+-- ----------------------------------------------------------------------------
+CREATE TABLE facility_point_sequence (
+    building_id BIGINT   NOT NULL COMMENT '所属建筑',
+    next_seq    BIGINT   NOT NULL COMMENT '下一个可分配的 FAC 尾号（四位序号），单调递增不复用',
+    updated_at  DATETIME          COMMENT '最近取号时间',
+    PRIMARY KEY (building_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT '点位编号流水（按建筑行锁取号）';
+
+INSERT INTO facility_point_sequence (building_id, next_seq, updated_at)
+SELECT b.id,
+       COALESCE((
+           SELECT MAX(CAST(SUBSTRING(p.fp_no, CHAR_LENGTH(p.fp_no) - 3) AS UNSIGNED)) + 1
+           FROM facility_point p
+           WHERE p.building_id = b.id
+             AND SUBSTRING(p.fp_no, CHAR_LENGTH(p.fp_no) - 3) REGEXP '^[0-9]{4}$'
+       ), 1),
+       '2026-09-29 00:00:00'
+FROM building b;
+
+CREATE TABLE facility_create_request (
+    action_key          VARCHAR(64)  NOT NULL COMMENT '客户端动作标识（幂等键），重发/重启重放复用',
+    building_id         BIGINT       NOT NULL COMMENT '所属建筑',
+    floor_id            BIGINT       NOT NULL COMMENT '所属楼层',
+    request_fingerprint CHAR(64)     NOT NULL COMMENT '首次请求内容 SHA-256（同标识不同内容拒绝）',
+    point_id            BIGINT                COMMENT '落成点位 id（与点位同事务回写，提交后必非空）',
+    point_code          VARCHAR(32)           COMMENT '实际分配的点位编号（回放凭据）',
+    created_by          VARCHAR(32)           COMMENT '提交人',
+    created_at          DATETIME     NOT NULL COMMENT '首次受理时间',
+    PRIMARY KEY (action_key),
+    UNIQUE KEY uk_fcr_point (point_id),
+    KEY idx_fcr_building (building_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT '点位新增动作幂等台账（只追加）';
 
 -- ----------------------------------------------------------------------------
 -- 模块三：巡检记录 + 明细行

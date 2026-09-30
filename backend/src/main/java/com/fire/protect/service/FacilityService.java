@@ -12,9 +12,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.fire.protect.common.BizException;
+import com.fire.protect.common.ConflictException;
 import com.fire.protect.domain.Building;
 import com.fire.protect.domain.BuildingFloor;
 import com.fire.protect.domain.DisablePermit;
+import com.fire.protect.domain.FacilityCreateRequest;
 import com.fire.protect.domain.FacilityPoint;
 import com.fire.protect.domain.FireDict;
 import com.fire.protect.dto.FacilityDtos;
@@ -23,7 +25,10 @@ import com.fire.protect.dto.Views;
 import com.fire.protect.repository.BuildingFloorRepository;
 import com.fire.protect.repository.BuildingRepository;
 import com.fire.protect.repository.DisablePermitRepository;
+import com.fire.protect.repository.FacilityCreateRequestRepository;
 import com.fire.protect.repository.FacilityPointRepository;
+import com.fire.protect.security.CurrentUserHolder;
+import com.fire.protect.domain.SysUser;
 
 /**
  * 模块二：消防设施点位。
@@ -36,24 +41,30 @@ import com.fire.protect.repository.FacilityPointRepository;
 public class FacilityService {
 
     private final FacilityPointRepository facilityPointRepository;
+    private final FacilityCreateRequestRepository createRequestRepository;
     private final BuildingRepository buildingRepository;
     private final BuildingFloorRepository buildingFloorRepository;
     private final BuildingService buildingService;
     private final MaintenanceService maintenanceService;
     private final DisablePermitRepository disablePermitRepository;
+    private final FacilityCreateTx createTx;
 
     public FacilityService(FacilityPointRepository facilityPointRepository,
+                           FacilityCreateRequestRepository createRequestRepository,
                            BuildingRepository buildingRepository,
                            BuildingFloorRepository buildingFloorRepository,
                            BuildingService buildingService,
                            MaintenanceService maintenanceService,
-                           DisablePermitRepository disablePermitRepository) {
+                           DisablePermitRepository disablePermitRepository,
+                           FacilityCreateTx createTx) {
         this.facilityPointRepository = facilityPointRepository;
+        this.createRequestRepository = createRequestRepository;
         this.buildingRepository = buildingRepository;
         this.buildingFloorRepository = buildingFloorRepository;
         this.buildingService = buildingService;
         this.maintenanceService = maintenanceService;
         this.disablePermitRepository = disablePermitRepository;
+        this.createTx = createTx;
     }
 
     /** 当前挂着许可停用标记的许可 id → 许可编号，供平面图 / 台账标注。 */
@@ -128,37 +139,54 @@ public class FacilityService {
     }
 
     /**
-     * 新增点位：只需要给建筑、楼层、类型与位置，
-     * 点位编码、检查周期、下次检查日全部交给 {@code @PrePersist}。
+     * 新增点位（并发安全 + 动作幂等）。
+     *
+     * <p>请求必须带客户端动作标识 {@code actionKey}：同一动作（超时重试 / 重复点击 /
+     * 网络重发 / 重启后重放）只返回第一次创建的点位，不再占用新编号；不同动作即使内容相同，
+     * 也各自落成一条有效点位并拿到不同编号。
+     *
+     * <p>取号（{@code facility_point_sequence} 行锁）、建点位、幂等台账回写在同一个数据库
+     * 事务里提交，任何一步失败整体回滚；可重试冲突统一抛 {@link ConflictException}（HTTP 409），
+     * 客户端用同一动作标识安全重试即可。
+     *
+     * <p>本方法本身不开事务：幂等回放走只读自动提交，写路径全部在 {@link FacilityCreateTx}
+     * 的独立事务内，写事务失败/回滚不会污染外层，请求仍可立刻重放。
      */
-    @Transactional
     public Views.FacilityView create(FacilityDtos.CreateReq req) {
-        Building building = buildingService.ensureBuilding(req.getBuildingId());
-        if (!FireDict.isValidFacilityType(req.getFacilityType())) {
-            throw new BizException("设施类型只能是：灭火器 / 消火栓 / 喷淋头 / 烟感探测器 / 手动报警按钮 / 应急照明 / 防火门 / 消防泵");
-        }
-        BuildingFloor floor = buildingFloorRepository.findById(req.getFloorId())
-                .orElseThrow(() -> new BizException("楼层不存在：" + req.getFloorId()));
-        if (!floor.getBuildingId().equals(building.getId())) {
-            throw new BizException("所选楼层不属于该建筑");
-        }
-        if (req.getStatus() != null && !FireDict.isValidPointStatus(req.getStatus())) {
-            throw new BizException("点位状态只能是：正常 / 待更换 / 故障 / 停用");
+        // 1. 无事务副作用的重放检查放在最前：已完成动作直接回放首次结果（重启后同样成立）
+        FacilityCreateRequest existing = createRequestRepository.findById(req.getActionKey()).orElse(null);
+        if (existing != null) {
+            return replay(existing, req);
         }
 
-        FacilityPoint point = new FacilityPoint();
-        point.setBuildingId(building.getId());
-        point.setFloorId(floor.getId());
-        point.setFacilityType(req.getFacilityType());
-        point.setSpec(req.getSpec());
-        point.setLocationDesc(req.getLocationDesc());
-        point.setInstallDate(req.getInstallDate());
-        point.setCheckCycleDays(req.getCheckCycleDays());
-        point.setPlanX(req.getPlanX() == null ? 500 : req.getPlanX());
-        point.setPlanY(req.getPlanY() == null ? 340 : req.getPlanY());
-        point.setStatus(req.getStatus() == null ? "NORMAL" : req.getStatus());
-        FacilityPoint saved = facilityPointRepository.save(point);
-        return toView(saved, building, floor, permitNoMap());
+        // 2. 独立事务执行：占位台账 → 行锁取号 → 建点位 → 回写台账
+        SysUser operator = CurrentUserHolder.get();
+        String operatorName = operator == null ? null : operator.getDisplayName();
+        String fingerprint = FacilityCreateFingerprint.of(req);
+        FacilityCreateTx.Result result = createTx.run(req, fingerprint, operatorName);
+        return toView(result.point(), result.building(), result.floor(), permitNoMap());
+    }
+
+    /**
+     * 同动作标识再次到达：核对内容指纹后回放首次点位，绝不二次创建。
+     * 指纹不一致 = 新动作误挂旧标识，拒绝并让客户端换新标识重提（不重试）。
+     */
+    private Views.FacilityView replay(FacilityCreateRequest ledger, FacilityDtos.CreateReq req) {
+        if (!ledger.getRequestFingerprint().equals(FacilityCreateFingerprint.of(req))) {
+            throw new BizException("该动作标识已用于另一条点位（表单内容不一致），请刷新后以新动作重新提交");
+        }
+        FacilityPoint point = ledger.getPointId() == null
+                ? null
+                : facilityPointRepository.findById(ledger.getPointId()).orElse(null);
+        if (point == null) {
+            // 正常路径不可达：台账与点位同事务，提交即同时存在。仅在数据被外部破坏时出现。
+            throw new ConflictException(
+                    "该动作的点位结果暂不可用，请联系管理员核对点位台账与编号流水后再处理，勿用同一标识重复建档");
+        }
+        Building building = buildingRepository.findById(point.getBuildingId()).orElse(null);
+        BuildingFloor floor = point.getFloorId() == null
+                ? null : buildingFloorRepository.findById(point.getFloorId()).orElse(null);
+        return toView(point, building, floor, permitNoMap());
     }
 
     /**

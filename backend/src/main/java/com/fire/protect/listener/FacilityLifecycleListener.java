@@ -13,8 +13,10 @@ import jakarta.persistence.PreUpdate;
  * 消防设施实体的生命周期回调（{@code BaseFacility} 及其子类通过 {@code @EntityListeners} 挂上来）。
  *
  * <ul>
- *   <li>{@code @PrePersist}：自动生成点位编码 FAC/EXT-&lt;建筑编号&gt;-&lt;四位序号&gt;，
- *       补齐安装日期与检查周期，并按「上次检查日 + 周期」算出下次检查日；</li>
+ *   <li>{@code @PrePersist}：点位编号正常由服务端通过 {@code facility_point_sequence}
+ *       流水表行锁预分配（FAC/EXT-&lt;建筑编号&gt;-&lt;四位序号&gt;，并发不撞号、删除不复用、
+ *       重放不重号），已经带编号的实体这里不再覆盖；只有绕过服务直接落库时才走「最大尾号 +1」兜底，
+ *       并补齐安装日期、按周期算出下次检查日；</li>
  *   <li>{@code @PreUpdate}：每次写入都按上次检查日重算下次检查日，
  *       已经过期且当前仍为「正常」的自动回落（点位→待更换，气瓶→待充装），到报废日期直接置「报废」。</li>
  * </ul>

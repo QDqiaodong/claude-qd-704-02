@@ -45,12 +45,13 @@ public class FacilityController {
     }
 
     /**
-     * 新增点位：点位编码与下次检查日都由 {@code @PrePersist} 生成，
-     * 请求里不需要（也不允许）带 pointCode / nextCheckDate。
+     * 新增点位：编号由服务端在数据库行锁内分配（并发不撞号、删除不复用），
+     * 请求必须带 actionKey：同动作重发只回放首次结果，不重复建点、不重复占号。
      */
     @PostMapping
     public ApiResponse<Views.FacilityView> create(@Valid @RequestBody FacilityDtos.CreateReq req) {
-        return ApiResponse.success("点位已建档，编码由系统自动生成", facilityService.create(req));
+        Views.FacilityView view = facilityService.create(req);
+        return ApiResponse.success("点位已建档，系统分配编号：" + view.pointCode(), view);
     }
 
     /** 标记已检：下次检查日由 {@code @PreUpdate} 按上次检查日 + 周期重算 */

@@ -16,6 +16,14 @@ public final class FacilityDtos {
     @Data
     public static class CreateReq {
 
+        /**
+         * 客户端动作标识（幂等键）：打开新增表单时生成一次，超时重试 / 重复点击 / 网络重发
+         * 必须复用同一个值，只有真正另起一次新增时才换新值。服务重启后仍据此识别已处理动作。
+         */
+        @NotBlank(message = "缺少动作标识 actionKey，请刷新页面后重试")
+        @Size(max = 64, message = "动作标识长度不超过 64 个字符")
+        private String actionKey;
+
         @NotNull(message = "所属建筑不能为空")
         private Long buildingId;
 

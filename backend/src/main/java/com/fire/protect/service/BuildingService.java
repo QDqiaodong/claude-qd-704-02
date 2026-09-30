@@ -16,12 +16,14 @@ import com.fire.protect.common.BizException;
 import com.fire.protect.domain.Building;
 import com.fire.protect.domain.BuildingFloor;
 import com.fire.protect.domain.FacilityPoint;
+import com.fire.protect.domain.FacilityPointSequence;
 import com.fire.protect.domain.FireDict;
 import com.fire.protect.dto.BuildingDtos;
 import com.fire.protect.dto.Views;
 import com.fire.protect.repository.BuildingFloorRepository;
 import com.fire.protect.repository.BuildingRepository;
 import com.fire.protect.repository.FacilityPointRepository;
+import com.fire.protect.repository.FacilityPointSequenceRepository;
 
 /** 模块一：建筑与楼层。新建建筑时按地上/地下层数自动生成楼层。 */
 @Service
@@ -30,13 +32,16 @@ public class BuildingService {
     private final BuildingRepository buildingRepository;
     private final BuildingFloorRepository buildingFloorRepository;
     private final FacilityPointRepository facilityPointRepository;
+    private final FacilityPointSequenceRepository facilityPointSequenceRepository;
 
     public BuildingService(BuildingRepository buildingRepository,
                            BuildingFloorRepository buildingFloorRepository,
-                           FacilityPointRepository facilityPointRepository) {
+                           FacilityPointRepository facilityPointRepository,
+                           FacilityPointSequenceRepository facilityPointSequenceRepository) {
         this.buildingRepository = buildingRepository;
         this.buildingFloorRepository = buildingFloorRepository;
         this.facilityPointRepository = facilityPointRepository;
+        this.facilityPointSequenceRepository = facilityPointSequenceRepository;
     }
 
     /** 建筑台账列表：每栋楼自带楼层列表（页面展开行直接用）。 */
@@ -117,6 +122,13 @@ public class BuildingService {
         building.setCreatedAt(now);
         building.setUpdatedAt(now);
         Building saved = buildingRepository.save(building);
+
+        // 点位编号流水一并就位：新建筑从 0001 起单调分配（并发取号走数据库行锁）
+        FacilityPointSequence sequence = new FacilityPointSequence();
+        sequence.setBuildingId(saved.getId());
+        sequence.setNextSeq(1L);
+        sequence.setUpdatedAt(now);
+        facilityPointSequenceRepository.save(sequence);
 
         // 楼层按建筑规模自动生成：层面积 = 总面积 / 总层数
         int total = above + below;

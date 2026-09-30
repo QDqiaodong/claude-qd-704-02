@@ -526,6 +526,17 @@ body {
   margin-bottom: 4px;
 }
 
+.fp-create-tip {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 18px;
+  color: #8a5a12;
+  background: #fdf6ec;
+  border: 1px solid #f5dab1;
+  border-radius: 4px;
+}
+
 @media (max-width: 1280px) {
   .fp-board {
     grid-template-columns: repeat(2, minmax(280px, 1fr));

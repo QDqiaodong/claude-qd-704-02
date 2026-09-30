@@ -32,8 +32,17 @@ http.interceptors.response.use(
   (err) => {
     const body = err.response && err.response.data
     const message = (body && body.message) || err.message || '网络异常，请稍后再试'
-    ElMessage.error(message)
-    return Promise.reject(new Error(message))
+    // 页面据此区分 409 可安全重试（保留表单、复用动作标识）与其它错误（换新动作标识）
+    const wrapped = new Error(message)
+    wrapped.status = err.response ? err.response.status : 0
+    wrapped.actionRetriable = wrapped.status === 409 || wrapped.status === 0
+    if (!err.response) {
+      // 超时 / 断网没有响应体：提示里明确「可能已成功，勿重复填表，重试即可回放」
+      ElMessage.error('请求超时或网络中断，请勿重复新增，系统将复用本次动作查询结果')
+    } else {
+      ElMessage.error(message)
+    }
+    return Promise.reject(wrapped)
   }
 )
 

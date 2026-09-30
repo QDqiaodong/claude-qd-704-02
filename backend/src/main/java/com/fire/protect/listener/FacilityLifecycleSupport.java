@@ -55,7 +55,11 @@ public class FacilityLifecycleSupport {
     }
 
     /**
-     * 前缀下的下一个四位序号：取同前缀已有编码的最大尾号 + 1（避免多人同时建点时撞号）。
+     * 前缀下的下一个四位序号：取同前缀已有编码的最大尾号 + 1。
+     *
+     * <p>注意：这是绕过服务直接持久化时的兜底口径，本身不加锁，不能用于业务并发新增。
+     * 正式新增点位走 {@code FacilityNumberService}：facility_point_sequence 行锁取号，
+     * 同建筑并发各拿各号、删除不回收、动作重放不重号。
      */
     long nextSequence(BaseFacility facility, String prefix) {
         long max = 0L;

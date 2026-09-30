@@ -31,6 +31,11 @@ public final class CurrentUserHolder {
         return user;
     }
 
+    /** 取当前操作人，未带头时返回 null（仅用于「可匿名」的留痕场景，不做权限拦截）。 */
+    public static SysUser get() {
+        return CURRENT.get();
+    }
+
     public static boolean isRole(String role) {
         SysUser user = CURRENT.get();
         return user != null && role.equals(user.getRole());
